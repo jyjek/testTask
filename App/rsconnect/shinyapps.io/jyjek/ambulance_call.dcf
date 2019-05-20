@@ -1,0 +1,13 @@
+name: ambulance_call
+title: ambulance_call
+username:
+account: jyjek
+server: shinyapps.io
+hostUrl: https://api.shinyapps.io/v1
+appId: 938852
+bundleId: 2097140
+url: https://jyjek.shinyapps.io/ambulance_call/
+when: 1558378886.07088
+asMultiple: FALSE
+asStatic: FALSE
+ignoredFiles: data/cities.rds

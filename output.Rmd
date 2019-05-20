@@ -1,0 +1,315 @@
+---
+title: "Test Task"
+description: |
+  "Motorbike Ambulance Calls"
+author:
+  - name: Shpiruk Dmytro
+    url: https://example.com/norajones
+    affiliation: in
+    affiliation_url: https://www.linkedin.com/in/dmytro-shpiruk/
+date: "`r Sys.Date()`"
+output: radix::radix_article
+---
+
+```{r  echo = T, message=F,error = F, layout="l-body-outset"}
+library(tidyverse)
+library(lubridate)
+library(anomalize)
+library(Metrics)
+library(rmarkdown)
+library(rsample)
+library(randomForest)
+library(caret)
+library(xgboost)
+library(recipes)
+
+dat <- readr::read_csv("data/motorbike_ambulance_calls.csv") %>% 
+      mutate(date = lubridate::mdy(date),
+             dttm = glue::glue('{date} {hr}') %>% lubridate::ymd_h(.)) %>% 
+  mutate_at(vars(season,holiday,weekday,weathersit,hr), as.factor)
+
+paged_table(dat)
+```
+
+
+# Побудуємо boxplots
+
+```{r, layout="l-body-outset", fig.width=6, fig.height=4.5, echo=T}
+plot_box <- function(df, var){
+  df %>% 
+    ggplot(aes(x= !!rlang::sym(var) %>% as.factor, y=cnt)) + geom_boxplot()
+}
+
+dat %>% select_if(is.factor) %>% colnames() %>% 
+  map(., function(x){
+    dat %>% plot_box(x)+
+      labs(x=x, title = glue::glue("{x} boxplot"))
+  })
+```
+
+
+# Пошук аномалій. Агрегація до доби
+Скористаємося бібліотекою [anomalize](https://business-science.github.io/anomalize/)
+
+
+```{r, layout="l-body-outset", fig.width=6, fig.height=4.5, echo=T}
+ dat %>% 
+  group_by(date) %>% 
+  summarise(cnt = sum(cnt) ) %>% 
+  tibbletime::as_tbl_time(.,index=date) %>%
+  time_decompose(cnt, method = "stl", frequency = "7 days", trend = "2 months") %>%
+  anomalize(remainder, method = "iqr", alpha = .04) %>%
+  time_recompose() %>%
+  plot_anomalies(time_recomposed = TRUE) +
+  labs(title = "Motorbike Anomalies", x = "Date", y = "Incedents")
+```
+
+## Розглянемо погодинний графік
+
+```{r, layout="l-body-outset", fig.width=6, fig.height=4.5, echo=T}
+anoms <- dat %>% 
+  tibbletime::as_tbl_time(.,index=dttm) %>%
+  time_decompose(cnt, method = "stl", frequency = "auto", trend = "auto") %>%
+  anomalize(remainder, method = "iqr") 
+
+anoms %>% 
+mutate(is_anom = ifelse(anomaly=="Yes",1,0)) %>% 
+  mutate(hr = date %>% ymd_hms() %>% hour) %>% 
+  group_by(hr) %>% 
+  summarise(anoms_count = sum(is_anom)) %>% 
+  filter(anoms_count >0) %>% 
+  arrange(anoms_count %>% desc)
+
+anoms %>% 
+  time_recompose() %>%
+  plot_anomalies(time_recomposed = TRUE) +
+  labs(title = "Motorbike Anomalies", x = "Date", y = "Incedents")
+```
+
+
+
+Застосуємо `kNNImpute` для заміни знайдених аномалій
+
+```{r, layout="l-body-outset", fig.width=6, fig.height=4.5, echo=T}
+
+knn_res <- dat %>% 
+  left_join(anoms %>% select(date,anomaly), by= c("dttm"="date")) %>% 
+  mutate(cnt = ifelse(anomaly=="Yes",NA,cnt)) %>% 
+  select(-anomaly)
+
+new_dat <- knn_res %>% recipe(cnt~.,data = knn_res) %>% 
+  step_knnimpute(all_outcomes(), neighbors = 10) %>% 
+  prep(data = knn_res) %>% 
+  bake(., new_data = knn_res)
+
+ summary(knn_res$cnt)
+ summary(new_dat$cnt)
+
+```
+
+# Побудуємо RF
+
+```{r, cache=F, echo=T}
+main_df <- new_dat %>% 
+  mutate_at(vars(yr,mnth,hr),as.factor) %>% 
+  select(-c(index,date,dttm))
+
+train_test_split <- initial_split(main_df, prop = 0.8)
+
+train_tbl <- training(train_test_split)
+test_tbl  <- testing(train_test_split)
+
+TrainControl <- trainControl( method = "repeatedcv", number = 10, repeats = 4)
+
+clf <- randomForest(cnt~., data = train_tbl, 
+                    ntree=300, #sampsize=5000,
+                    trainControl=TrainControl,
+                    importance=T)
+result <- test_tbl %>% 
+  add_column( prediction = predict(clf,test_tbl )) %>% 
+  mutate(mape = abs(cnt - prediction)/cnt*100)
+result$mape %>% mean
+  clf %>% randomForest::importance() %>% data.frame() %>% 
+    rownames_to_column() %>% 
+    select(rowname,IncNodePurity) %>% 
+    rename(Overall=IncNodePurity) %>% 
+    mutate( rowname=as.factor(rowname)) %>% 
+    top_n(15,Overall) %>% 
+    ggplot(aes(x=reorder(rowname, Overall),y=Overall))+geom_col(fill="darkgreen")+
+    labs(x="Variable",y="Gini")+ 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+    coord_flip()
+
+```
+
+# Побудуємо xgboost
+
+## Розподіл кількості викликів
+
+```{r, echo=T}
+dat$cnt %>% hist(breaks =50)
+```
+
+## Застосуємо розподіл [tweedie](https://www.kaggle.com/c/allstate-claims-severity/discussion/25208)
+
+```{r, cache=F, echo=T, warning=F, message=F}
+
+rec_obj <- recipe(cnt~.,data = train_tbl) %>%
+  step_dummy(all_predictors(), -all_numeric()) %>%
+  step_center(all_predictors())  %>%
+  step_scale(all_predictors()) %>%
+  step_zv(all_predictors(), -all_outcomes())%>%
+  prep(data = train_tbl)
+
+x_train_tbl <- bake(rec_obj, new_data = train_tbl)
+x_test_tbl  <- bake(rec_obj, new_data = test_tbl)
+
+dtrain<-xgboost::xgb.DMatrix( data=x_train_tbl %>% select(-cnt) %>%  as.matrix(), label = x_train_tbl$cnt )
+dtest <- xgb.DMatrix(data = x_test_tbl %>% select(-cnt) %>% as.matrix(), label= x_test_tbl$cnt )
+
+  watchlist <- list(train=dtrain, test=dtest)
+  
+  bst <- xgb.train(data=dtrain, nrounds=400,trControl=TrainControl,print_every_n = 100,
+                   watchlist=watchlist, objective = "reg:tweedie")
+  
+  pred <- predict(bst,dtest)
+  
+  res_xg <- test_tbl %>%
+    add_column(predict=pred) %>%
+    mutate(mape = abs(cnt-predict)/cnt*100)
+  
+  res_xg$mape %>% mean  
+  
+  xgb.importance(model = bst) %>%
+    data.frame()%>%
+    arrange(desc(Gain))%>%
+    mutate(val=Gain/sum(Gain),
+           cumsum=cumsum(val),
+           value=round(val*100,2)) %>% 
+    filter(value>2) %>% 
+    ggplot(aes(x=reorder(Feature, value),y=value))+geom_col(fill="darkgreen")+
+    labs(x="Variable",y="Gini")+ 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+    coord_flip()
+```
+
+### Як бачимо, `xgboost` показує кращі результати, ніж `rf`, спробуємо підібрати оптимальні параметри для збільшення точності
+
+### Підберемо оптимальні параметри
+
+```{r, cache=T, echo=T, warning=F, message=F}
+source("helper.R")
+ xgb_expand_grid <- expand.grid(
+   # nrounds          = c(50,100,200,400),
+    eta              = c(.3, .5, .7),
+    max_depth        = c(3, 5, 7),
+    gamma            = c(.1, .3, .5),
+    colsample_bytree = c(1),
+    iter             = c(1,2,4),
+    min_child_weight = 1,
+    subsample        = c(0.75, 1)) %>% 
+    dplyr::as_data_frame() %>% 
+    dplyr::mutate(model_id = 1:nrow(.)) %>% 
+    dplyr::mutate(seed_number = sample.int(n = 10**4, size = nrow(.), replace = F))
+
+  xgb_expand_grid_result <- xgb_expand_grid %>% 
+    dplyr::group_by(model_id, seed_number) %>%
+    tidyr::nest(.key = params_df) %>%
+    dplyr::mutate(params_list = purrr::map(params_df, purrr::flatten)) %>% 
+    dplyr::mutate(
+      xgb_cv_model = purrr::map2(
+        params_list,
+        seed_number,
+         ~xgb_cv_grid(
+          data = dtrain,
+          list_of_params = ..1,
+          seed = ..2
+        )
+      )
+    )
+  
+   xgb_expand_grid_result_best <- xgb_expand_grid_result %>% 
+    dplyr::mutate(
+      xgb_cv_model_best_result = purrr::map(
+        .x = xgb_cv_model,
+        .f = ~{
+          .x$evaluation_log %>% 
+            dplyr::filter_at(
+              .vars = vars("test_rmse_mean"), 
+              .vars_predicate = any_vars(. == max(.))
+            ) %>% 
+            dplyr::select_at(.vars = vars("iter", "train_rmse_mean", "test_rmse_mean"))
+        }
+      )
+    ) %>% 
+    dplyr::select(model_id, seed_number, params_df, xgb_cv_model_best_result) %>% 
+    tidyr::unnest() 
+  
+  best_model <- xgb_expand_grid_result_best %>% 
+    top_n(1,-test_rmse_mean)
+  
+  
+  fin_model <- xgb.train(data=dtrain, trControl=TrainControl,watchlist=watchlist, objective = "reg:tweedie",
+                     nrounds = 400,# early_stopping_rounds = 50,
+                     eta = best_model$eta,
+                     max.depth = best_model$max_depth,
+                     #nthread = 2,
+                     gamma = best_model$gamma,
+                     subsample = best_model$subsample,
+                     colsample_bytree = best_model$colsample_bytree,
+                     iter = 2,
+                     print_every_n = 100
+                     )
+
+   result_xg <- test_tbl %>%
+    add_column(predict=predict(fin_model,dtest)) %>%
+    mutate(mape = abs(cnt-predict)/cnt*100)
+   result_xg$mape %>% mean  
+  
+```
+
+### Як ми бачимо, найвпливовішим фактором є `workingday`. Побудуємо окремі моделі для вихідних та будніх
+
+```{r, cache=T, echo=T, warning=F, message=F}
+work_res <- main_df %>%  group_by(workingday) %>% 
+    nest %>% 
+    left_join(readRDS("data/best_vals_workdays_fin.rds") %>% 
+                select(workingday,best_mod),by="workingday") %>%
+    mutate( split = map(data, initial_split),
+            training_data = map(split, training),
+            testing_data  = map(split, testing),
+            rec = map(training_data,
+                      ~(recipe(cnt~.,data = ..1) %>% 
+                          step_dummy(all_predictors(), -all_numeric()) %>% 
+                          step_center(all_predictors())  %>%
+                          step_scale(all_predictors()) %>% 
+                          step_zv(all_predictors(), -all_outcomes())%>%
+                          prep(data = ..1))),
+            x_train = map2(training_data,rec, ~ (bake(..2, new_data = ..1))),
+            x_test = map2(testing_data,rec, ~ (bake(..2, new_data = ..1))),
+            
+            to_predict = map(x_train, ~(xgboost::xgb.DMatrix(data=..1 %>% select(-cnt) %>%  as.matrix(), label = ..1$cnt  )  )),
+            to_valid   = map(x_test,    ~(xgboost::xgb.DMatrix(data=..1 %>% select(-cnt) %>%  as.matrix(), label = ..1$cnt  )  )),
+            model = pmap( list(to_predict,to_valid,best_mod), ~(
+              xgb.train(data=..1, trControl=TrainControl,watchlist=list(train=..1, test=..2), objective = "reg:tweedie",
+                        nrounds = 400, 
+                        early_stopping_rounds = 30,
+                        eta = ..3$eta,
+                        max.depth = ..3$max_depth,
+                        gamma = ..3$gamma,
+                        subsample = ..3$subsample,
+                        colsample_bytree = ..3$colsample_bytree,
+                        iter = 4,
+                        print_every_n = 100)
+            )),
+            result = map2(model,to_valid, ~(predict(..1,..2)))
+    )
+work_res %>% 
+  select(workingday,x_test,result) %>% 
+  unnest() %>% 
+  mutate(mape = abs(cnt-result)/cnt*100) %>% 
+  group_by(workingday) %>% 
+  summarise(mape = mean(mape))
+
+```
+
