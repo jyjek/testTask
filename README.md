@@ -6,7 +6,7 @@
  Побудовано модель за допомгою `randomForest` та `xgboost`. Розглянуто вплив змінних<br>
  Обрано кращий алгоритм та підбір оптимальних параметрів, побудовано різні моделі для найвпливовішого фактору `workingday`<br>
 
-<h3>Shiny App</h3>
+<h3>[Shiny App](https://jyjek.shinyapps.io/ambulance_call)</h3>
 **Оптимальні налаштування 80% zoom у браузері.**<br>
 На вкладці `Motorbike issues` :
 
