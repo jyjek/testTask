@@ -8,7 +8,12 @@
  Виявлені аномалії замінено за допомогою `knnImpute` з пакету `recipes`<br>
  Побудовано модель за допомгою `randomForest` та `xgboost`. Розглянуто та проаналізовано вплив змінних.<br>
  Обрано кращий алгоритм та виконано підбір оптимальних параметрів. Побудовано різні моделі для найвпливовішого, за результатами аналізу, фактору - `workingday`
-
+ 
+### Aльтернативний варіант прогнозування: `fasster` + `tsibble` + `fable`
+ 
+  - [Video](https://www.youtube.com/watch?v=6YlboftSalY)
+  - [Presentation](https://mitchelloharawild.com/user2018)
+  
 <h3>[Shiny App](https://jyjek.shinyapps.io/ambulance_call)</h3>
 Оптимальні налаштування 80% zoom у браузері.<br>
 Не повністю адаптовано для мобільногих та планшетних розширень. 
